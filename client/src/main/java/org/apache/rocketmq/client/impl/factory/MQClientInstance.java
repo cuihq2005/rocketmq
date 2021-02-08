@@ -188,7 +188,7 @@ public class MQClientInstance {
                     if (null == brokerData) {
                         continue;
                     }
-
+                    // Note: 如果该broker集群中没有了master，则不对该集群做写入
                     if (!brokerData.getBrokerAddrs().containsKey(MixAll.MASTER_ID)) {
                         continue;
                     }
