@@ -84,6 +84,10 @@ import org.apache.rocketmq.remoting.exception.RemotingException;
 import org.apache.rocketmq.remoting.netty.NettyClientConfig;
 import org.apache.rocketmq.remoting.protocol.RemotingCommand;
 
+// NOTE: MQClientInstance
+// 这个应该是客户端的中转类
+// 该类被Consumer、Producer持有，执行各种远程操作
+// 该类持有MQClientAPIImpl、MQAdminImpl、PullMessageService、RebalanceService，调用他们执行真正的操作
 public class MQClientInstance {
     private final static long LOCK_TIMEOUT_MILLIS = 3000;
     private final InternalLogger log = ClientLogger.getLog();
@@ -92,31 +96,47 @@ public class MQClientInstance {
     private final String clientId;
     private final long bootTimestamp = System.currentTimeMillis();
     private final ConcurrentMap<String/* group */, MQProducerInner> producerTable = new ConcurrentHashMap<String, MQProducerInner>();
+    // 保存所有consumer的map
     private final ConcurrentMap<String/* group */, MQConsumerInner> consumerTable = new ConcurrentHashMap<String, MQConsumerInner>();
     private final ConcurrentMap<String/* group */, MQAdminExtInner> adminExtTable = new ConcurrentHashMap<String, MQAdminExtInner>();
+    // 客户端配置
     private final NettyClientConfig nettyClientConfig;
+    // 网络操作的api接口
     private final MQClientAPIImpl mQClientAPIImpl;
+
     private final MQAdminImpl mQAdminImpl;
+    // 保存每个topic的路由信息，包含broker信息（brokerName及name的所有brokerId）和每个queue信息（brokerName、readNums、writeNums）
     private final ConcurrentMap<String/* Topic */, TopicRouteData> topicRouteTable = new ConcurrentHashMap<String, TopicRouteData>();
     private final Lock lockNamesrv = new ReentrantLock();
     private final Lock lockHeartbeat = new ReentrantLock();
+    // 保存broker地址的map，key为brokerName，value为由brokerId及地址组成的map
     private final ConcurrentMap<String/* Broker Name */, HashMap<Long/* brokerId */, String/* address */>> brokerAddrTable =
         new ConcurrentHashMap<String, HashMap<Long, String>>();
+    // 保存broker版本？暂时还不知道什么用处
     private final ConcurrentMap<String/* Broker Name */, HashMap<String/* address */, Integer>> brokerVersionTable =
         new ConcurrentHashMap<String, HashMap<String, Integer>>();
+    // 一个单线程的ScheduledExecutorService
     private final ScheduledExecutorService scheduledExecutorService = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
         @Override
         public Thread newThread(Runnable r) {
             return new Thread(r, "MQClientFactoryScheduledThread");
         }
     });
+    // 貌似是处理broker发送过来的请求
     private final ClientRemotingProcessor clientRemotingProcessor;
+    // 消息拉取服务
     private final PullMessageService pullMessageService;
+    // 消费的rebalance服务
     private final RebalanceService rebalanceService;
+    // 一个默认的producer，作用暂时未知
     private final DefaultMQProducer defaultMQProducer;
+    // 消费统计
     private final ConsumerStatsManager consumerStatsManager;
+    // 发送心跳次数
     private final AtomicLong sendHeartbeatTimesTotal = new AtomicLong(0);
+    // 服务状态
     private ServiceState serviceState = ServiceState.CREATE_JUST;
+    // 随机数，产生随机数，用来随机选择broker
     private Random random = new Random();
 
     public MQClientInstance(ClientConfig clientConfig, int instanceIndex, String clientId) {
@@ -132,6 +152,7 @@ public class MQClientInstance {
         this.clientRemotingProcessor = new ClientRemotingProcessor(this);
         this.mQClientAPIImpl = new MQClientAPIImpl(this.nettyClientConfig, this.clientRemotingProcessor, rpcHook, clientConfig);
 
+        // 如果指定了namesrv，使用该namesrv更新mQClientAPIImpl的namesrv列表
         if (this.clientConfig.getNamesrvAddr() != null) {
             this.mQClientAPIImpl.updateNameServerAddressList(this.clientConfig.getNamesrvAddr());
             log.info("user specified name server address: {}", this.clientConfig.getNamesrvAddr());
@@ -157,9 +178,11 @@ public class MQClientInstance {
             MQVersion.getVersionDesc(MQVersion.CURRENT_VERSION), RemotingCommand.getSerializeTypeConfigInThisServer());
     }
 
+    // 将topicRouteDate转换为producer的路由信息
     public static TopicPublishInfo topicRouteData2TopicPublishInfo(final String topic, final TopicRouteData route) {
         TopicPublishInfo info = new TopicPublishInfo();
         info.setTopicRouteData(route);
+        // 顺序的topic，貌似是在orderTopicConf中顺序配置brokerName和和writeQueueNums // 暂忽略
         if (route.getOrderTopicConf() != null && route.getOrderTopicConf().length() > 0) {
             String[] brokers = route.getOrderTopicConf().split(";");
             for (String broker : brokers) {
@@ -173,6 +196,7 @@ public class MQClientInstance {
 
             info.setOrderTopic(true);
         } else {
+            // 取得所有broker信息
             List<QueueData> qds = route.getQueueDatas();
             Collections.sort(qds);
             for (QueueData qd : qds) {

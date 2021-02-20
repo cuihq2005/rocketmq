@@ -24,11 +24,17 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.rocketmq.client.common.ThreadLocalIndex;
 
+// NOTE: 延迟容错实现类
 public class LatencyFaultToleranceImpl implements LatencyFaultTolerance<String> {
     private final ConcurrentHashMap<String, FaultItem> faultItemTable = new ConcurrentHashMap<String, FaultItem>(16);
 
+    // 在pickOneAtLeast方法中，用来获取一个broker时使用的index
+    // 感觉这名字怪怪的
+    // 没想明白非要用一个threadlocal的好处
     private final ThreadLocalIndex whichItemWorst = new ThreadLocalIndex();
 
+    // 更新broker延迟及可用状态
+    // 有则更新无则新建，没啥好说的
     @Override
     public void updateFaultItem(final String name, final long currentLatency, final long notAvailableDuration) {
         FaultItem old = this.faultItemTable.get(name);
@@ -48,6 +54,9 @@ public class LatencyFaultToleranceImpl implements LatencyFaultTolerance<String> 
         }
     }
 
+    // 判断broker是否可用
+    // 如果faultItemTable中没有，则可用；否则调用faultItem判断
+    // faultItem会根据startTimestamp判断是否可用
     @Override
     public boolean isAvailable(final String name) {
         final FaultItem faultItem = this.faultItemTable.get(name);
@@ -62,20 +71,25 @@ public class LatencyFaultToleranceImpl implements LatencyFaultTolerance<String> 
         this.faultItemTable.remove(name);
     }
 
+    // 选择一个broker
     @Override
     public String pickOneAtLeast() {
         final Enumeration<FaultItem> elements = this.faultItemTable.elements();
+        // 新建一个linkedList，遍历faultItemTable，将FaultItem放入list
         List<FaultItem> tmpList = new LinkedList<FaultItem>();
         while (elements.hasMoreElements()) {
             final FaultItem faultItem = elements.nextElement();
             tmpList.add(faultItem);
         }
-
+        // tmpList不为空时，从中选择一个broker;否则返回空
+        // 不为空的判断为啥不在开始做，怕concurrentHashmap的isEmpty耗时长吗？
         if (!tmpList.isEmpty()) {
-            Collections.shuffle(tmpList);
+            Collections.shuffle(tmpList); // 先打乱顺序
 
-            Collections.sort(tmpList);
+            Collections.sort(tmpList); // 再排序 (O_O)? 既然要排序，干嘛还要打乱顺序？
 
+            // 将tmpList.size()/2，选择前一半的broker
+            // faultItem按延迟排序，故性能较好的会排在前面
             final int half = tmpList.size() / 2;
             if (half <= 0) {
                 return tmpList.get(0).getName();

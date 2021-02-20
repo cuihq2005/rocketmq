@@ -25,9 +25,13 @@ import java.util.HashMap;
 import java.util.List;
 import org.apache.rocketmq.remoting.protocol.RemotingSerializable;
 
+// NOTE: topic的路由信息
 public class TopicRouteData extends RemotingSerializable {
+    // 顺序消息的配置内容，目前还不知道格式和使用方式
     private String orderTopicConf;
+    // 该topic所在broker的信息，包含brokerName、readQueueNums、writeQueueNums等
     private List<QueueData> queueDatas;
+    // 该topic所在broker的地址信息，包含clusterName、brokerName、brokerId及对应的地址（brokerId=0是master，其它是slave）
     private List<BrokerData> brokerDatas;
     private HashMap<String/* brokerAddr */, List<String>/* Filter Server */> filterServerTable;
 
