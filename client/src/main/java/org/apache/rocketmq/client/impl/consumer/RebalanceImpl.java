@@ -522,7 +522,7 @@ public abstract class RebalanceImpl {
         Iterator<Entry<MessageQueue, ProcessQueue>> it = this.processQueueTable.entrySet().iterator();
         while (it.hasNext()) {
             Entry<MessageQueue, ProcessQueue> next = it.next();
-            next.getValue().setDropped(true);
+            next.getValue().setDropped(true); // dropped=true
         }
 
         this.processQueueTable.clear();

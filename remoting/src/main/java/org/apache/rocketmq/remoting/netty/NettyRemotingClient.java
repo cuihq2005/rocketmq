@@ -69,6 +69,14 @@ import org.apache.rocketmq.remoting.exception.RemotingTooMuchRequestException;
 import org.apache.rocketmq.remoting.protocol.RemotingCommand;
 
 // NOTE: 远程通信类，实际维护同远程的连接，发送接收数据
+// 资源情况:
+// eventLoopGroupWorker,线程名NettyClientSelector_%d，1线程
+// publicExecutor, 线程名NettyClientPublicExecutor_, 线程数为cpu核数，最少4
+// callbackExecutor,procuder有方法可设置该callbackExecutor，不设置使用publicExecutor，按不设置处理
+// defaultEventExecutorGroup, 线程名NettyClientWorkerThread_， 默认4
+// timer, 线程名ClientHouseKeepingService，1线程
+// 故最少10个线程
+
 public class NettyRemotingClient extends NettyRemotingAbstract implements RemotingClient {
     private static final InternalLogger log = InternalLoggerFactory.getLogger(RemotingHelper.ROCKETMQ_REMOTING);
 

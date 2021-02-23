@@ -53,9 +53,12 @@ public class PullAPIWrapper {
     private final InternalLogger log = ClientLogger.getLog();
     private final MQClientInstance mQClientFactory;
     private final String consumerGroup;
+    // 这个属性一直没找到合适的解释，忽略先
     private final boolean unitMode;
+    // 一个map，保存了这个messageQueue优先从哪个broker读取
     private ConcurrentMap<MessageQueue, AtomicLong/* brokerId */> pullFromWhichNodeTable =
         new ConcurrentHashMap<MessageQueue, AtomicLong>(32);
+    // litePullConsumer的一个属性，暂忽略，只考虑push的
     private volatile boolean connectBrokerByUser = false;
     private volatile long defaultBrokerId = MixAll.MASTER_ID;
     private Random random = new Random(System.currentTimeMillis());
@@ -67,15 +70,21 @@ public class PullAPIWrapper {
         this.unitMode = unitMode;
     }
 
+    // 处理PullMessage的结果
     public PullResult processPullResult(final MessageQueue mq, final PullResult pullResult,
         final SubscriptionData subscriptionData) {
         PullResultExt pullResultExt = (PullResultExt) pullResult;
-
+        // 更新这个mq建议的brokerId
         this.updatePullFromWhichNode(mq, pullResultExt.getSuggestWhichBrokerId());
         if (PullStatus.FOUND == pullResult.getPullStatus()) {
+            // 找到了消息后，如果是根据tag查询，还需要在此处判断下是否是正确的tag
+            // broker的tag按hashcode存储，故有可能取出来的不是需要的tag
             ByteBuffer byteBuffer = ByteBuffer.wrap(pullResultExt.getMessageBinary());
+
+            // 解包
             List<MessageExt> msgList = MessageDecoder.decodes(byteBuffer);
 
+            // 新建一个list，重新按tag过滤一次
             List<MessageExt> msgListFilterAgain = msgList;
             if (!subscriptionData.getTagsSet().isEmpty() && !subscriptionData.isClassFilterMode()) {
                 msgListFilterAgain = new ArrayList<MessageExt>(msgList.size());
@@ -100,13 +109,14 @@ public class PullAPIWrapper {
                 if (Boolean.parseBoolean(traFlag)) {
                     msg.setTransactionId(msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX));
                 }
+                // 每个消息里都保存上最小、最大offset，保存brokerName
                 MessageAccessor.putProperty(msg, MessageConst.PROPERTY_MIN_OFFSET,
                     Long.toString(pullResult.getMinOffset()));
                 MessageAccessor.putProperty(msg, MessageConst.PROPERTY_MAX_OFFSET,
                     Long.toString(pullResult.getMaxOffset()));
                 msg.setBrokerName(mq.getBrokerName());
             }
-
+            // 重置msgList
             pullResultExt.setMsgFoundList(msgListFilterAgain);
         }
 
@@ -115,6 +125,7 @@ public class PullAPIWrapper {
         return pullResult;
     }
 
+    // 更新队列从哪个broker拉数据
     public void updatePullFromWhichNode(final MessageQueue mq, final long brokerId) {
         AtomicLong suggest = this.pullFromWhichNodeTable.get(mq);
         if (null == suggest) {
@@ -140,6 +151,7 @@ public class PullAPIWrapper {
         }
     }
 
+    // 拉取消息
     public PullResult pullKernelImpl(
         final MessageQueue mq,
         final String subExpression,
@@ -154,10 +166,13 @@ public class PullAPIWrapper {
         final CommunicationMode communicationMode,
         final PullCallback pullCallback
     ) throws MQClientException, RemotingException, MQBrokerException, InterruptedException {
+
+        // 查找pull要使用的broker，包含broker地址等信息
         FindBrokerResult findBrokerResult =
             this.mQClientFactory.findBrokerAddressInSubscribe(mq.getBrokerName(),
                 this.recalculatePullFromWhichNode(mq), false);
         if (null == findBrokerResult) {
+            // 如果没找到，从namesrv重新获取下路由信息，再重新查找
             this.mQClientFactory.updateTopicRouteInfoFromNameServer(mq.getTopic());
             findBrokerResult =
                 this.mQClientFactory.findBrokerAddressInSubscribe(mq.getBrokerName(),
@@ -167,6 +182,7 @@ public class PullAPIWrapper {
         if (findBrokerResult != null) {
             {
                 // check version
+                // 看这段，应该是4.1.0以前的版本只支持tag
                 if (!ExpressionType.isTagType(expressionType)
                     && findBrokerResult.getBrokerVersion() < MQVersion.Version.V4_1_0_SNAPSHOT.ordinal()) {
                     throw new MQClientException("The broker[" + mq.getBrokerName() + ", "
@@ -176,6 +192,8 @@ public class PullAPIWrapper {
             int sysFlagInner = sysFlag;
 
             if (findBrokerResult.isSlave()) {
+                // slave要clearCommitOffsetFlag，从名字上看是不报错commitOffset
+                // 这个应该是broker主从同步的问题，先不细看了
                 sysFlagInner = PullSysFlag.clearCommitOffsetFlag(sysFlagInner);
             }
 
@@ -197,6 +215,7 @@ public class PullAPIWrapper {
                 brokerAddr = computePullFromWhichFilterServer(mq.getTopic(), brokerAddr);
             }
 
+            // 拉取消息
             PullResult pullResult = this.mQClientFactory.getMQClientAPIImpl().pullMessage(
                 brokerAddr,
                 requestHeader,
@@ -207,9 +226,11 @@ public class PullAPIWrapper {
             return pullResult;
         }
 
+        // 没有找到拉取使用的broker，抛出异常
         throw new MQClientException("The broker[" + mq.getBrokerName() + "] not exist", null);
     }
 
+    // 计算从哪个broker读取消息
     public long recalculatePullFromWhichNode(final MessageQueue mq) {
         if (this.isConnectBrokerByUser()) {
             return this.defaultBrokerId;

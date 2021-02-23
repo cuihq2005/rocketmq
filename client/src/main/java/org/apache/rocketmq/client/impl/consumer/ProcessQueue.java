@@ -161,6 +161,7 @@ public class ProcessQueue {
                 msgCount.addAndGet(validMsgCnt);
 
                 // this.consuming是一个状态值，目前没看明白是用来干嘛的
+                // 目前看到this.consuming在takeMessages且没有消息时被置为false,而takeMessages实在顺序消费的messageService中使用，忽略吧
                 if (!msgTreeMap.isEmpty() && !this.consuming) {
                     dispatchToConsume = true;
                     this.consuming = true;
@@ -168,6 +169,7 @@ public class ProcessQueue {
 
                 // 通过消息中PROPERTY_MAX_OFFSET属性，计算了下broker中该queue还有多少消息，即针对queue的消息积压数
                 // 很奇怪的方式，不知道是每次返回的最后一个消息里携带该属性，还是每个消息都携带
+                // 从PullAPIWrapper.processPullResult可看出，每个消息都会携带
                 if (!msgs.isEmpty()) {
                     MessageExt messageExt = msgs.get(msgs.size() - 1);
                     String property = messageExt.getProperty(MessageConst.PROPERTY_MAX_OFFSET);

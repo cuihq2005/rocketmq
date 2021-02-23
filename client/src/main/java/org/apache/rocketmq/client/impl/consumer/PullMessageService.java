@@ -91,6 +91,8 @@ public class PullMessageService extends ServiceThread {
     // 拉取消息
     // 根据consumerGrup，从mQClientFactory查询Consumer
     // 调用Consumer的pullMessage方法，从broker拉取消息
+    // pullRequest的processQueue在rebalanceImpl destroy时会被drop，故旧的关闭的consumer的pullRequest会被忽略
+    // 即使在上一个consumer关闭，同名的新consumer已创建
     private void pullMessage(final PullRequest pullRequest) {
         final MQConsumerInner consumer = this.mQClientFactory.selectConsumer(pullRequest.getConsumerGroup());
         if (consumer != null) {
