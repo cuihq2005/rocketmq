@@ -625,10 +625,11 @@ public class DefaultMQPushConsumerImpl implements MQConsumerInner {
                 // awaitTerminateMillis=0,不会有安全关闭
                 this.consumeMessageService.shutdown(awaitTerminateMillis);
                 // 保存当前消费进度
-                // 并发消费时有可能先消费offset大的，导致小的offset被跳过,故shutdown时，最好将消息消费完，保证消息不会被遗漏
-                // 但consumeMessageService的shutdown时，awaitTerminateMillis=0，故会马上调用shutdownNow，队列中的消费没机会被消费
-                // 从这点上说，rocketmq的至少消费一次是打了折扣的
+                // consumeMessageService的shutdown时，awaitTerminateMillis=0，故会马上调用shutdownNow，队列中的消费没机会被消费
                 // 目前还没想出shutdown时优雅关闭的方法，如果设置awaitTerminateMillis，系统停止时怕耗时太长，再想想...
+                // offset保存的是确认被消费的最小的offset，如果大的先被消费，并不会被更新到offsetStore中
+                // 故rocketmq做到了至少消费一次
+                // consumer shutdown时，如果没有等待时间，rocketmq会保存当前进度，可能会造成消息重复消费，但不会有消息丢失
                 this.persistConsumerOffset();
                 // 从MQClientInstance的consumerTable中移除自己
                 this.mQClientFactory.unregisterConsumer(this.defaultMQPushConsumer.getConsumerGroup());

@@ -110,7 +110,7 @@ public class ConsumeMessageConcurrentlyService implements ConsumeMessageService 
         // 关闭这个线程池，不会取消延迟提交的消息，但后续consumeExecutor关闭后，也无法提交消费了，所以这些消息应该是被废弃了
         this.scheduledExecutorService.shutdown();
         // 优雅的关闭线程池，最多等待awaitTerminateMillis毫秒
-        // awaitTerminateMillis=0,没啥用
+        // 默认awaitTerminateMillis=0,没啥用
         ThreadUtils.shutdownGracefully(this.consumeExecutor, awaitTerminateMillis, TimeUnit.MILLISECONDS);
         // 关闭周期清理过期消息的线程池 // 周期任务会被直接cancel掉
         this.cleanExpireMsgExecutors.shutdown();
@@ -348,10 +348,12 @@ public class ConsumeMessageConcurrentlyService implements ConsumeMessageService 
                 break;
         }
 
-        // 从processQueue中删除已消费的消息，并返回最大的offset
+        // 从processQueue中删除已消费的消息，并剩余最小的offset
+        // 使用该offset更新offsetStore，更新时，保证offset只会增加
+        // 从process删除消息后，返回的offset是剩余最小的offset，所以虽然是并发消费，如果offset大的先被消费了，也不会把大的offset更新
+        // rocketmq用这种方式保证消息至少会被提交一次
         long offset = consumeRequest.getProcessQueue().removeMessage(consumeRequest.getMsgs());
         if (offset >= 0 && !consumeRequest.getProcessQueue().isDropped()) {
-            // 更新offsetStore的offset，更新时，保证offset只会增加
             this.defaultMQPushConsumerImpl.getOffsetStore().updateOffset(consumeRequest.getMessageQueue(), offset, true);
         }
     }
@@ -458,6 +460,8 @@ public class ConsumeMessageConcurrentlyService implements ConsumeMessageService 
                     }
                 }
                 // 消费消息
+                // 这里我一般习惯将消息提交到线程池处理
+                // 如果线程池满，则由consumeExecutor的线程处理，故一般consumeExecutor的线程我会设置的比较小，比如1或者2
                 status = listener.consumeMessage(Collections.unmodifiableList(msgs), context);
             } catch (Throwable e) {
                 log.warn("consumeMessage exception: {} Group: {} Msgs: {} MQ: {}",
