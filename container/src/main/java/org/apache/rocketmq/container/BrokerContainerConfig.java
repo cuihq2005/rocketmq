@@ -19,7 +19,7 @@ package org.apache.rocketmq.container;
 
 import org.apache.rocketmq.common.MixAll;
 import org.apache.rocketmq.common.annotation.ImportantField;
-import org.apache.rocketmq.remoting.common.RemotingUtil;
+import org.apache.rocketmq.common.utils.NetworkUtil;
 
 public class BrokerContainerConfig {
 
@@ -29,12 +29,20 @@ public class BrokerContainerConfig {
     private String namesrvAddr = System.getProperty(MixAll.NAMESRV_ADDR_PROPERTY, System.getenv(MixAll.NAMESRV_ADDR_ENV));
 
     @ImportantField
+    private boolean fetchNameSrvAddrByDnsLookup = false;
+
+    @ImportantField
     private boolean fetchNamesrvAddrByAddressServer = false;
 
     @ImportantField
-    private String brokerContainerIP = RemotingUtil.getLocalAddress();
+    private String brokerContainerIP = NetworkUtil.getLocalAddress();
 
     private String brokerConfigPaths = null;
+    
+    /**
+     * The interval to fetch namesrv addr, default value is 10 second
+     */
+    private long fetchNamesrvAddrInterval = 10 * 1000;
 
     public String getRocketmqHome() {
         return rocketmqHome;
@@ -50,6 +58,14 @@ public class BrokerContainerConfig {
 
     public void setNamesrvAddr(String namesrvAddr) {
         this.namesrvAddr = namesrvAddr;
+    }
+
+    public boolean isFetchNameSrvAddrByDnsLookup() {
+        return fetchNameSrvAddrByDnsLookup;
+    }
+
+    public void setFetchNameSrvAddrByDnsLookup(boolean fetchNameSrvAddrByDnsLookup) {
+        this.fetchNameSrvAddrByDnsLookup = fetchNameSrvAddrByDnsLookup;
     }
 
     public boolean isFetchNamesrvAddrByAddressServer() {
@@ -71,5 +87,12 @@ public class BrokerContainerConfig {
     public void setBrokerConfigPaths(String brokerConfigPaths) {
         this.brokerConfigPaths = brokerConfigPaths;
     }
-
+    
+    public long getFetchNamesrvAddrInterval() {
+        return fetchNamesrvAddrInterval;
+    }
+    
+    public void setFetchNamesrvAddrInterval(final long fetchNamesrvAddrInterval) {
+        this.fetchNamesrvAddrInterval = fetchNamesrvAddrInterval;
+    }
 }

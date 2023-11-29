@@ -20,6 +20,7 @@ package org.apache.rocketmq.proxy.processor;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Objects;
 import com.google.common.base.Stopwatch;
+import io.netty.channel.Channel;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -37,22 +38,24 @@ import org.apache.rocketmq.client.consumer.AckStatus;
 import org.apache.rocketmq.common.ThreadFactoryImpl;
 import org.apache.rocketmq.common.constant.LoggerName;
 import org.apache.rocketmq.common.consumer.ReceiptHandle;
-import org.apache.rocketmq.common.subscription.RetryPolicy;
-import org.apache.rocketmq.common.subscription.SubscriptionGroupConfig;
 import org.apache.rocketmq.common.thread.ThreadPoolMonitor;
 import org.apache.rocketmq.common.utils.ConcurrentHashMapUtils;
-import org.apache.rocketmq.proxy.common.AbstractStartAndShutdown;
+import org.apache.rocketmq.common.utils.AbstractStartAndShutdown;
 import org.apache.rocketmq.proxy.common.MessageReceiptHandle;
 import org.apache.rocketmq.proxy.common.ProxyContext;
 import org.apache.rocketmq.proxy.common.ProxyException;
 import org.apache.rocketmq.proxy.common.ProxyExceptionCode;
 import org.apache.rocketmq.proxy.common.ReceiptHandleGroup;
-import org.apache.rocketmq.proxy.common.StartAndShutdown;
+import org.apache.rocketmq.proxy.common.RenewStrategyPolicy;
+import org.apache.rocketmq.common.utils.StartAndShutdown;
+import org.apache.rocketmq.proxy.common.channel.ChannelHelper;
 import org.apache.rocketmq.proxy.common.utils.ExceptionUtils;
 import org.apache.rocketmq.proxy.config.ConfigurationManager;
 import org.apache.rocketmq.proxy.config.ProxyConfig;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.rocketmq.remoting.protocol.subscription.RetryPolicy;
+import org.apache.rocketmq.remoting.protocol.subscription.SubscriptionGroupConfig;
+import org.apache.rocketmq.logging.org.slf4j.Logger;
+import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;
 
 public class ReceiptHandleProcessor extends AbstractStartAndShutdown {
     protected final static Logger log = LoggerFactory.getLogger(LoggerName.PROXY_LOGGER_NAME);
@@ -61,6 +64,7 @@ public class ReceiptHandleProcessor extends AbstractStartAndShutdown {
         Executors.newSingleThreadScheduledExecutor(new ThreadFactoryImpl("RenewalScheduledThread_"));
     protected ThreadPoolExecutor renewalWorkerService;
     protected final MessagingProcessor messagingProcessor;
+    protected final static RetryPolicy RENEW_POLICY = new RenewStrategyPolicy();
 
     public ReceiptHandleProcessor(MessagingProcessor messagingProcessor) {
         this.messagingProcessor = messagingProcessor;
@@ -104,7 +108,12 @@ public class ReceiptHandleProcessor extends AbstractStartAndShutdown {
                     }
                     if (args[0] instanceof ClientChannelInfo) {
                         ClientChannelInfo clientChannelInfo = (ClientChannelInfo) args[0];
-                        clearGroup(new ReceiptHandleGroupKey(clientChannelInfo.getClientId(), group));
+                        if (ChannelHelper.isRemote(clientChannelInfo.getChannel())) {
+                            // if the channel sync from other proxy is expired, not to clear data of connect to current proxy
+                            return;
+                        }
+                        clearGroup(new ReceiptHandleGroupKey(clientChannelInfo.getChannel(), group));
+                        log.info("clear handle of this client when client unregister. group:{}, clientChannelInfo:{}", group, clientChannelInfo);
                     }
                 }
             }
@@ -145,7 +154,7 @@ public class ReceiptHandleProcessor extends AbstractStartAndShutdown {
             log.error("unexpect error when schedule renew task", e);
         }
 
-        log.info("scan for renewal done. cost:{}ms", stopwatch.elapsed().toMillis());
+        log.debug("scan for renewal done. cost:{}ms", stopwatch.elapsed().toMillis());
     }
 
     protected void renewMessage(ReceiptHandleGroup group, String msgID, String handleStr) {
@@ -167,10 +176,10 @@ public class ReceiptHandleProcessor extends AbstractStartAndShutdown {
                 log.warn("handle has exceed max renewRetryTimes. handle:{}", messageReceiptHandle);
                 return CompletableFuture.completedFuture(null);
             }
-            if (current - messageReceiptHandle.getTimestamp() < messageReceiptHandle.getExpectInvisibleTime()) {
+            if (current - messageReceiptHandle.getConsumeTimestamp() < proxyConfig.getRenewMaxTimeMillis()) {
                 CompletableFuture<AckResult> future =
                     messagingProcessor.changeInvisibleTime(context, handle, messageReceiptHandle.getMessageId(),
-                        messageReceiptHandle.getGroup(), messageReceiptHandle.getTopic(), proxyConfig.getRenewSliceTimeMillis());
+                        messageReceiptHandle.getGroup(), messageReceiptHandle.getTopic(), RENEW_POLICY.nextDelayDuration(messageReceiptHandle.getRenewTimes()));
                 future.whenComplete((ackResult, throwable) -> {
                     if (throwable != null) {
                         log.error("error when renew. handle:{}", messageReceiptHandle, throwable);
@@ -183,15 +192,16 @@ public class ReceiptHandleProcessor extends AbstractStartAndShutdown {
                     } else if (AckStatus.OK.equals(ackResult.getStatus())) {
                         messageReceiptHandle.updateReceiptHandle(ackResult.getExtraInfo());
                         messageReceiptHandle.resetRenewRetryTimes();
+                        messageReceiptHandle.incrementRenewTimes();
                         resFuture.complete(messageReceiptHandle);
                     } else {
-                        log.error("renew response is not ok. result:{}, handle:{}", ackResult, messageReceiptHandle, throwable);
+                        log.error("renew response is not ok. result:{}, handle:{}", ackResult, messageReceiptHandle);
                         resFuture.complete(null);
                     }
                 });
             } else {
                 SubscriptionGroupConfig subscriptionGroupConfig =
-                    messagingProcessor.getMetadataService().getSubscriptionGroupConfig(messageReceiptHandle.getGroup());
+                    messagingProcessor.getMetadataService().getSubscriptionGroupConfig(context, messageReceiptHandle.getGroup());
                 if (subscriptionGroupConfig == null) {
                     log.error("group's subscriptionGroupConfig is null when renew. handle: {}", messageReceiptHandle);
                     return CompletableFuture.completedFuture(null);
@@ -227,15 +237,15 @@ public class ReceiptHandleProcessor extends AbstractStartAndShutdown {
     }
 
     protected boolean clientIsOffline(ReceiptHandleGroupKey groupKey) {
-        return this.messagingProcessor.findConsumerChannel(createContext("JudgeClientOnline"), groupKey.group, groupKey.clientId) == null;
+        return this.messagingProcessor.findConsumerChannel(createContext("JudgeClientOnline"), groupKey.group, groupKey.channel) == null;
     }
 
-    public void addReceiptHandle(String clientID, String group, String msgID, String receiptHandle,
+    public void addReceiptHandle(ProxyContext ctx, Channel channel, String group, String msgID, String receiptHandle,
         MessageReceiptHandle messageReceiptHandle) {
-        this.addReceiptHandle(new ReceiptHandleGroupKey(clientID, group), msgID, receiptHandle, messageReceiptHandle);
+        this.addReceiptHandle(ctx, new ReceiptHandleGroupKey(channel, group), msgID, receiptHandle, messageReceiptHandle);
     }
 
-    protected void addReceiptHandle(ReceiptHandleGroupKey key, String msgID, String receiptHandle,
+    protected void addReceiptHandle(ProxyContext ctx, ReceiptHandleGroupKey key, String msgID, String receiptHandle,
         MessageReceiptHandle messageReceiptHandle) {
         if (key == null) {
             return;
@@ -244,11 +254,11 @@ public class ReceiptHandleProcessor extends AbstractStartAndShutdown {
             k -> new ReceiptHandleGroup()).put(msgID, receiptHandle, messageReceiptHandle);
     }
 
-    public MessageReceiptHandle removeReceiptHandle(String clientID, String group, String msgID, String receiptHandle) {
-        return this.removeReceiptHandle(new ReceiptHandleGroupKey(clientID, group), msgID, receiptHandle);
+    public MessageReceiptHandle removeReceiptHandle(ProxyContext ctx, Channel channel, String group, String msgID, String receiptHandle) {
+        return this.removeReceiptHandle(ctx, new ReceiptHandleGroupKey(channel, group), msgID, receiptHandle);
     }
 
-    protected MessageReceiptHandle removeReceiptHandle(ReceiptHandleGroupKey key, String msgID, String receiptHandle) {
+    protected MessageReceiptHandle removeReceiptHandle(ProxyContext ctx, ReceiptHandleGroupKey key, String msgID, String receiptHandle) {
         if (key == null) {
             return null;
         }
@@ -299,20 +309,24 @@ public class ReceiptHandleProcessor extends AbstractStartAndShutdown {
     }
 
     public static class ReceiptHandleGroupKey {
-        private final String clientId;
-        private final String group;
+        protected final Channel channel;
+        protected final String group;
 
-        public ReceiptHandleGroupKey(String clientId, String group) {
-            this.clientId = clientId;
+        public ReceiptHandleGroupKey(Channel channel, String group) {
+            this.channel = channel;
             this.group = group;
         }
 
-        public String getClientId() {
-            return clientId;
+        protected String getChannelId() {
+            return channel.id().asLongText();
         }
 
         public String getGroup() {
             return group;
+        }
+
+        public Channel getChannel() {
+            return channel;
         }
 
         @Override
@@ -324,18 +338,18 @@ public class ReceiptHandleProcessor extends AbstractStartAndShutdown {
                 return false;
             }
             ReceiptHandleGroupKey key = (ReceiptHandleGroupKey) o;
-            return Objects.equal(clientId, key.clientId) && Objects.equal(group, key.group);
+            return Objects.equal(getChannelId(), key.getChannelId()) && Objects.equal(group, key.group);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hashCode(clientId, group);
+            return Objects.hashCode(getChannelId(), group);
         }
 
         @Override
         public String toString() {
             return MoreObjects.toStringHelper(this)
-                .add("clientId", clientId)
+                .add("channelId", getChannelId())
                 .add("group", group)
                 .toString();
         }

@@ -16,24 +16,25 @@
  */
 package org.apache.rocketmq.broker.processor;
 
+import io.netty.channel.ChannelHandlerContext;
+import io.opentelemetry.api.common.Attributes;
 import java.nio.ByteBuffer;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-
-import io.netty.channel.ChannelHandlerContext;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.rocketmq.broker.BrokerController;
-import org.apache.rocketmq.broker.mqtrace.AbortProcessException;
+import org.apache.rocketmq.broker.metrics.BrokerMetricsManager;
 import org.apache.rocketmq.broker.mqtrace.SendMessageContext;
-import org.apache.rocketmq.common.message.MessageExtBatch;
-import org.apache.rocketmq.common.statictopic.LogicQueueMappingItem;
+import org.apache.rocketmq.common.AbortProcessException;
 import org.apache.rocketmq.common.MQVersion;
 import org.apache.rocketmq.common.MixAll;
 import org.apache.rocketmq.common.TopicConfig;
 import org.apache.rocketmq.common.TopicFilterType;
-import org.apache.rocketmq.common.statictopic.TopicQueueMappingContext;
-import org.apache.rocketmq.common.statictopic.TopicQueueMappingDetail;
 import org.apache.rocketmq.common.UtilAll;
+import org.apache.rocketmq.common.attribute.CleanupPolicy;
+import org.apache.rocketmq.common.attribute.TopicMessageType;
 import org.apache.rocketmq.common.constant.PermName;
 import org.apache.rocketmq.common.help.FAQUrl;
 import org.apache.rocketmq.common.message.MessageAccessor;
@@ -41,19 +42,24 @@ import org.apache.rocketmq.common.message.MessageClientIDSetter;
 import org.apache.rocketmq.common.message.MessageConst;
 import org.apache.rocketmq.common.message.MessageDecoder;
 import org.apache.rocketmq.common.message.MessageExt;
-import org.apache.rocketmq.common.protocol.RequestCode;
-import org.apache.rocketmq.common.protocol.ResponseCode;
-import org.apache.rocketmq.common.protocol.header.SendMessageRequestHeader;
-import org.apache.rocketmq.common.protocol.header.SendMessageResponseHeader;
-import org.apache.rocketmq.common.subscription.SubscriptionGroupConfig;
+import org.apache.rocketmq.common.message.MessageExtBatch;
+import org.apache.rocketmq.common.message.MessageExtBrokerInner;
 import org.apache.rocketmq.common.sysflag.MessageSysFlag;
 import org.apache.rocketmq.common.topic.TopicValidator;
+import org.apache.rocketmq.common.utils.CleanupPolicyUtils;
 import org.apache.rocketmq.common.utils.QueueTypeUtils;
 import org.apache.rocketmq.remoting.exception.RemotingCommandException;
 import org.apache.rocketmq.remoting.netty.NettyRequestProcessor;
 import org.apache.rocketmq.remoting.protocol.RemotingCommand;
+import org.apache.rocketmq.remoting.protocol.RequestCode;
+import org.apache.rocketmq.remoting.protocol.ResponseCode;
+import org.apache.rocketmq.remoting.protocol.header.SendMessageRequestHeader;
+import org.apache.rocketmq.remoting.protocol.header.SendMessageResponseHeader;
+import org.apache.rocketmq.remoting.protocol.statictopic.LogicQueueMappingItem;
+import org.apache.rocketmq.remoting.protocol.statictopic.TopicQueueMappingContext;
+import org.apache.rocketmq.remoting.protocol.statictopic.TopicQueueMappingDetail;
+import org.apache.rocketmq.remoting.protocol.subscription.SubscriptionGroupConfig;
 import org.apache.rocketmq.store.AppendMessageResult;
-import org.apache.rocketmq.common.message.MessageExtBrokerInner;
 import org.apache.rocketmq.store.DefaultMessageStore;
 import org.apache.rocketmq.store.MessageStore;
 import org.apache.rocketmq.store.PutMessageResult;
@@ -61,6 +67,10 @@ import org.apache.rocketmq.store.config.BrokerRole;
 import org.apache.rocketmq.store.config.StorePathConfigHelper;
 import org.apache.rocketmq.store.stats.BrokerStatsManager;
 
+import static org.apache.rocketmq.broker.metrics.BrokerMetricsConstant.LABEL_CONSUMER_GROUP;
+import static org.apache.rocketmq.broker.metrics.BrokerMetricsConstant.LABEL_IS_SYSTEM;
+import static org.apache.rocketmq.broker.metrics.BrokerMetricsConstant.LABEL_MESSAGE_TYPE;
+import static org.apache.rocketmq.broker.metrics.BrokerMetricsConstant.LABEL_TOPIC;
 import static org.apache.rocketmq.remoting.protocol.RemotingCommand.buildErrorResponse;
 
 public class SendMessageProcessor extends AbstractSendMessageProcessor implements NettyRequestProcessor {
@@ -72,7 +82,7 @@ public class SendMessageProcessor extends AbstractSendMessageProcessor implement
     @Override
     public RemotingCommand processRequest(ChannelHandlerContext ctx,
         RemotingCommand request) throws RemotingCommandException {
-        SendMessageContext traceContext;
+        SendMessageContext sendMessageContext;
         switch (request.getCode()) {
             case RequestCode.CONSUMER_SEND_MSG_BACK:
                 return this.consumerSendMsgBack(ctx, request);
@@ -86,11 +96,9 @@ public class SendMessageProcessor extends AbstractSendMessageProcessor implement
                 if (rewriteResult != null) {
                     return rewriteResult;
                 }
-                traceContext = buildMsgContext(ctx, requestHeader);
-                String owner = request.getExtFields().get(BrokerStatsManager.COMMERCIAL_OWNER);
-                traceContext.setCommercialOwner(owner);
+                sendMessageContext = buildMsgContext(ctx, requestHeader, request);
                 try {
-                    this.executeSendMessageHookBefore(ctx, request, traceContext);
+                    this.executeSendMessageHookBefore(sendMessageContext);
                 } catch (AbortProcessException e) {
                     final RemotingCommand errorResponse = RemotingCommand.createResponseCommand(e.getResponseCode(), e.getErrorMessage());
                     errorResponse.setOpaque(request.getOpaque());
@@ -99,10 +107,10 @@ public class SendMessageProcessor extends AbstractSendMessageProcessor implement
 
                 RemotingCommand response;
                 if (requestHeader.isBatch()) {
-                    response = this.sendBatchMessage(ctx, request, traceContext, requestHeader, mappingContext,
+                    response = this.sendBatchMessage(ctx, request, sendMessageContext, requestHeader, mappingContext,
                         (ctx1, response1) -> executeSendMessageHookAfter(response1, ctx1));
                 } else {
-                    response = this.sendMessage(ctx, request, traceContext, requestHeader, mappingContext,
+                    response = this.sendMessage(ctx, request, sendMessageContext, requestHeader, mappingContext,
                         (ctx12, response12) -> executeSendMessageHookAfter(response12, ctx12));
                 }
 
@@ -176,8 +184,23 @@ public class SendMessageProcessor extends AbstractSendMessageProcessor implement
                 maxReconsumeTimes = requestHeader.getMaxReconsumeTimes();
             }
             int reconsumeTimes = requestHeader.getReconsumeTimes() == null ? 0 : requestHeader.getReconsumeTimes();
-            // Using '>' instead of '>=' to compatible with the case that reconsumeTimes here are increased by client.
-            if (reconsumeTimes > maxReconsumeTimes) {
+
+            boolean sendRetryMessageToDeadLetterQueueDirectly = false;
+            if (!brokerController.getRebalanceLockManager().isLockAllExpired(groupName)) {
+                LOGGER.info("Group has unexpired lock record, which show it is ordered message, send it to DLQ "
+                        + "right now group={}, topic={}, reconsumeTimes={}, maxReconsumeTimes={}.", groupName,
+                    newTopic, reconsumeTimes, maxReconsumeTimes);
+                sendRetryMessageToDeadLetterQueueDirectly = true;
+            }
+
+            if (reconsumeTimes > maxReconsumeTimes || sendRetryMessageToDeadLetterQueueDirectly) {
+                Attributes attributes = BrokerMetricsManager.newAttributesBuilder()
+                    .put(LABEL_CONSUMER_GROUP, requestHeader.getProducerGroup())
+                    .put(LABEL_TOPIC, requestHeader.getTopic())
+                    .put(LABEL_IS_SYSTEM, BrokerMetricsManager.isSystem(requestHeader.getTopic(), requestHeader.getProducerGroup()))
+                    .build();
+                BrokerMetricsManager.sendToDlqMessages.add(1, attributes);
+
                 properties.put(MessageConst.PROPERTY_DELAY_TIME_LEVEL, "-1");
                 newTopic = MixAll.getDLQTopic(groupName);
                 int queueIdInt = randomQueueId(DLQ_NUMS_PER_GROUP);
@@ -245,6 +268,16 @@ public class SendMessageProcessor extends AbstractSendMessageProcessor implement
         }
 
         MessageAccessor.setProperties(msgInner, oriProps);
+
+        CleanupPolicy cleanupPolicy = CleanupPolicyUtils.getDeletePolicy(Optional.of(topicConfig));
+        if (Objects.equals(cleanupPolicy, CleanupPolicy.COMPACTION)) {
+            if (StringUtils.isBlank(msgInner.getKeys())) {
+                response.setCode(ResponseCode.MESSAGE_ILLEGAL);
+                response.setRemark("Required message key is missing");
+                return response;
+            }
+        }
+
         msgInner.setTagsCode(MessageExtBrokerInner.tagsString2tagsCode(topicConfig.getTopicFilterType(), msgInner.getTags()));
         msgInner.setBornTimestamp(requestHeader.getBornTimestamp());
         msgInner.setBornHost(ctx.channel().remoteAddress());
@@ -285,7 +318,7 @@ public class SendMessageProcessor extends AbstractSendMessageProcessor implement
             asyncPutMessageFuture.thenAcceptAsync(putMessageResult -> {
                 RemotingCommand responseFuture =
                     handlePutMessageResult(putMessageResult, response, request, finalMsgInner, responseHeader, sendMessageContext,
-                        ctx, finalQueueIdInt, beginTimeMillis, mappingContext);
+                        ctx, finalQueueIdInt, beginTimeMillis, mappingContext, BrokerMetricsManager.getMessageType(requestHeader));
                 if (responseFuture != null) {
                     doResponse(ctx, request, responseFuture);
                 }
@@ -300,16 +333,16 @@ public class SendMessageProcessor extends AbstractSendMessageProcessor implement
             } else {
                 putMessageResult = this.brokerController.getMessageStore().putMessage(msgInner);
             }
-            handlePutMessageResult(putMessageResult, response, request, msgInner, responseHeader, sendMessageContext, ctx, queueIdInt, beginTimeMillis, mappingContext);
+            handlePutMessageResult(putMessageResult, response, request, msgInner, responseHeader, sendMessageContext, ctx, queueIdInt, beginTimeMillis, mappingContext, BrokerMetricsManager.getMessageType(requestHeader));
             sendMessageCallback.onComplete(sendMessageContext, response);
             return response;
         }
     }
 
     private RemotingCommand handlePutMessageResult(PutMessageResult putMessageResult, RemotingCommand response,
-        RemotingCommand request, MessageExt msg,
-        SendMessageResponseHeader responseHeader, SendMessageContext sendMessageContext, ChannelHandlerContext ctx,
-        int queueIdInt, long beginTimeMillis, TopicQueueMappingContext mappingContext) {
+        RemotingCommand request, MessageExt msg, SendMessageResponseHeader responseHeader,
+        SendMessageContext sendMessageContext, ChannelHandlerContext ctx, int queueIdInt, long beginTimeMillis,
+        TopicQueueMappingContext mappingContext, TopicMessageType messageType) {
         if (putMessageResult == null) {
             response.setCode(ResponseCode.SYSTEM_ERROR);
             response.setRemark("store putMessage return null");
@@ -354,7 +387,7 @@ public class SendMessageProcessor extends AbstractSendMessageProcessor implement
             case WHEEL_TIMER_MSG_ILLEGAL:
                 response.setCode(ResponseCode.MESSAGE_ILLEGAL);
                 response.setRemark(String.format("timer message illegal, the delay time should not be bigger than the max delay %dms; or if set del msg, the delay time should be bigger than the current time",
-                    this.brokerController.getMessageStoreConfig().getTimerMaxDelaySec() * 1000));
+                    this.brokerController.getMessageStoreConfig().getTimerMaxDelaySec() * 1000L));
                 break;
             case WHEEL_TIMER_FLOW_CONTROL:
                 response.setCode(ResponseCode.SYSTEM_ERROR);
@@ -365,6 +398,7 @@ public class SendMessageProcessor extends AbstractSendMessageProcessor implement
                 response.setCode(ResponseCode.SYSTEM_ERROR);
                 response.setRemark(String.format("accurate timer message is not enabled, timerWheelEnable is %s",
                      this.brokerController.getMessageStoreConfig().isTimerWheelEnable()));
+                break;
             case SERVICE_NOT_AVAILABLE:
                 response.setCode(ResponseCode.SERVICE_NOT_AVAILABLE);
                 response.setRemark(
@@ -404,9 +438,20 @@ public class SendMessageProcessor extends AbstractSendMessageProcessor implement
             this.brokerController.getBrokerStatsManager().incTopicPutNums(msg.getTopic(), putMessageResult.getAppendMessageResult().getMsgNum(), 1);
             this.brokerController.getBrokerStatsManager().incTopicPutSize(msg.getTopic(),
                 putMessageResult.getAppendMessageResult().getWroteBytes());
-            this.brokerController.getBrokerStatsManager().incBrokerPutNums(putMessageResult.getAppendMessageResult().getMsgNum());
+            this.brokerController.getBrokerStatsManager().incBrokerPutNums(msg.getTopic(), putMessageResult.getAppendMessageResult().getMsgNum());
             this.brokerController.getBrokerStatsManager().incTopicPutLatency(msg.getTopic(), queueIdInt,
                 (int) (this.brokerController.getMessageStore().now() - beginTimeMillis));
+
+            if (!BrokerMetricsManager.isRetryOrDlqTopic(msg.getTopic())) {
+                Attributes attributes = BrokerMetricsManager.newAttributesBuilder()
+                    .put(LABEL_TOPIC, msg.getTopic())
+                    .put(LABEL_MESSAGE_TYPE, messageType.getMetricsValue())
+                    .put(LABEL_IS_SYSTEM, TopicValidator.isSystemTopic(msg.getTopic()))
+                    .build();
+                BrokerMetricsManager.messagesInTotal.add(putMessageResult.getAppendMessageResult().getMsgNum(), attributes);
+                BrokerMetricsManager.throughputInTotal.add(putMessageResult.getAppendMessageResult().getWroteBytes(), attributes);
+                BrokerMetricsManager.messageSize.record(putMessageResult.getAppendMessageResult().getWroteBytes() / putMessageResult.getAppendMessageResult().getMsgNum(), attributes);
+            }
 
             response.setRemark(null);
 
@@ -455,10 +500,9 @@ public class SendMessageProcessor extends AbstractSendMessageProcessor implement
                 int wroteSize = request.getBody().length;
                 int msgNum = Math.max(appendMessageResult != null ? appendMessageResult.getMsgNum() : 1, 1);
                 int commercialMsgNum = (int) Math.ceil(wroteSize / (double) commercialSizePerMsg);
-                int incValue = commercialMsgNum;
 
                 sendMessageContext.setCommercialSendStats(BrokerStatsManager.StatsType.SEND_FAILURE);
-                sendMessageContext.setCommercialSendTimes(incValue);
+                sendMessageContext.setCommercialSendTimes(commercialMsgNum);
                 sendMessageContext.setCommercialSendSize(wroteSize);
                 sendMessageContext.setCommercialOwner(owner);
 
@@ -557,7 +601,7 @@ public class SendMessageProcessor extends AbstractSendMessageProcessor implement
             asyncPutMessageFuture.thenAcceptAsync(putMessageResult -> {
                 RemotingCommand responseFuture =
                     handlePutMessageResult(putMessageResult, response, request, messageExtBatch, responseHeader,
-                        sendMessageContext, ctx, finalQueueIdInt, beginTimeMillis, mappingContext);
+                        sendMessageContext, ctx, finalQueueIdInt, beginTimeMillis, mappingContext, BrokerMetricsManager.getMessageType(requestHeader));
                 if (responseFuture != null) {
                     doResponse(ctx, request, responseFuture);
                 }
@@ -572,7 +616,8 @@ public class SendMessageProcessor extends AbstractSendMessageProcessor implement
             } else {
                 putMessageResult = this.brokerController.getMessageStore().putMessages(messageExtBatch);
             }
-            handlePutMessageResult(putMessageResult, response, request, messageExtBatch, responseHeader, sendMessageContext, ctx, queueIdInt, beginTimeMillis, mappingContext);
+            handlePutMessageResult(putMessageResult, response, request, messageExtBatch, responseHeader,
+                sendMessageContext, ctx, queueIdInt, beginTimeMillis, mappingContext, BrokerMetricsManager.getMessageType(requestHeader));
             sendMessageCallback.onComplete(sendMessageContext, response);
             return response;
         }

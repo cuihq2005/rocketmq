@@ -29,21 +29,23 @@ import org.apache.rocketmq.client.exception.MQClientException;
 import org.apache.rocketmq.common.ThreadFactoryImpl;
 import org.apache.rocketmq.common.constant.LoggerName;
 import org.apache.rocketmq.common.message.MessageQueue;
-import org.apache.rocketmq.common.protocol.ResponseCode;
-import org.apache.rocketmq.common.protocol.route.TopicRouteData;
 import org.apache.rocketmq.common.thread.ThreadPoolMonitor;
-import org.apache.rocketmq.logging.InternalLogger;
-import org.apache.rocketmq.logging.InternalLoggerFactory;
+import org.apache.rocketmq.logging.org.slf4j.Logger;
+import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;
 import org.apache.rocketmq.proxy.common.AbstractCacheLoader;
-import org.apache.rocketmq.proxy.common.AbstractStartAndShutdown;
+import org.apache.rocketmq.common.utils.AbstractStartAndShutdown;
 import org.apache.rocketmq.proxy.common.Address;
+import org.apache.rocketmq.proxy.common.ProxyContext;
 import org.apache.rocketmq.proxy.config.ConfigurationManager;
 import org.apache.rocketmq.proxy.config.ProxyConfig;
-import org.apache.rocketmq.proxy.service.mqclient.MQClientAPIFactory;
+import org.apache.rocketmq.client.impl.mqclient.MQClientAPIFactory;
+import org.apache.rocketmq.remoting.protocol.ResponseCode;
+import org.apache.rocketmq.remoting.protocol.route.TopicRouteData;
+import org.checkerframework.checker.nullness.qual.NonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 public abstract class TopicRouteService extends AbstractStartAndShutdown {
-    private static final InternalLogger log = InternalLoggerFactory.getLogger(LoggerName.PROXY_LOGGER_NAME);
+    private static final Logger log = LoggerFactory.getLogger(LoggerName.PROXY_LOGGER_NAME);
 
     private final MQClientAPIFactory mqClientAPIFactory;
 
@@ -88,6 +90,16 @@ public abstract class TopicRouteService extends AbstractStartAndShutdown {
                         throw e;
                     }
                 }
+
+                @Override public @Nullable MessageQueueView reload(@NonNull String key,
+                    @NonNull MessageQueueView oldValue) throws Exception {
+                    try {
+                        return load(key);
+                    } catch (Exception e) {
+                        log.warn(String.format("reload topic route from namesrv. topic: %s", key), e);
+                        return oldValue;
+                    }
+                }
             });
 
         this.init();
@@ -98,23 +110,23 @@ public abstract class TopicRouteService extends AbstractStartAndShutdown {
         this.appendStartAndShutdown(this.mqClientAPIFactory);
     }
 
-    public MessageQueueView getAllMessageQueueView(String topicName) throws Exception {
+    public MessageQueueView getAllMessageQueueView(ProxyContext ctx, String topicName) throws Exception {
         return getCacheMessageQueueWrapper(this.topicCache, topicName);
     }
 
-    public abstract MessageQueueView getCurrentMessageQueueView(String topicName) throws Exception;
+    public abstract MessageQueueView getCurrentMessageQueueView(ProxyContext ctx, String topicName) throws Exception;
 
-    public abstract ProxyTopicRouteData getTopicRouteForProxy(List<Address> requestHostAndPortList,
+    public abstract ProxyTopicRouteData getTopicRouteForProxy(ProxyContext ctx, List<Address> requestHostAndPortList,
         String topicName) throws Exception;
 
-    public abstract String getBrokerAddr(String brokerName) throws Exception;
+    public abstract String getBrokerAddr(ProxyContext ctx, String brokerName) throws Exception;
 
-    public abstract AddressableMessageQueue buildAddressableMessageQueue(MessageQueue messageQueue) throws Exception;
+    public abstract AddressableMessageQueue buildAddressableMessageQueue(ProxyContext ctx, MessageQueue messageQueue) throws Exception;
 
     protected static MessageQueueView getCacheMessageQueueWrapper(LoadingCache<String, MessageQueueView> topicCache,
         String key) throws Exception {
         MessageQueueView res = topicCache.get(key);
-        if (res.isEmptyCachedQueue()) {
+        if (res != null && res.isEmptyCachedQueue()) {
             throw new MQClientException(ResponseCode.TOPIC_NOT_EXIST,
                 "No topic route info in name server for the topic: " + key);
         }

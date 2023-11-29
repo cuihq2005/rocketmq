@@ -25,13 +25,13 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import java.util.concurrent.ConcurrentHashMap;
 import org.apache.rocketmq.common.BrokerConfig;
 import org.apache.rocketmq.common.UtilAll;
 import org.apache.rocketmq.common.message.Message;
 import org.apache.rocketmq.common.message.MessageDecoder;
 import org.apache.rocketmq.common.message.MessageExt;
 import org.apache.rocketmq.common.message.MessageExtBatch;
-import org.apache.rocketmq.store.CommitLog.MessageExtEncoder;
 import org.apache.rocketmq.store.config.MessageStoreConfig;
 import org.junit.After;
 import org.junit.Before;
@@ -56,7 +56,7 @@ public class AppendCallbackTest {
         messageStoreConfig.setStorePathRootDir(System.getProperty("java.io.tmpdir") + File.separator + "unitteststore");
         messageStoreConfig.setStorePathCommitLog(System.getProperty("java.io.tmpdir") + File.separator + "unitteststore" + File.separator + "commitlog");
         //too much reference
-        DefaultMessageStore messageStore = new DefaultMessageStore(messageStoreConfig, null, null, new BrokerConfig());
+        DefaultMessageStore messageStore = new DefaultMessageStore(messageStoreConfig, null, null, new BrokerConfig(), new ConcurrentHashMap<>());
         CommitLog commitLog = new CommitLog(messageStore);
         callback = commitLog.new DefaultAppendMessageCallback();
     }
