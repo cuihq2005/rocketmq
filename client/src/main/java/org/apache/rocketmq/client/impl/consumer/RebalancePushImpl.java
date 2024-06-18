@@ -16,9 +16,6 @@
  */
 package org.apache.rocketmq.client.impl.consumer;
 
-import java.util.List;
-import java.util.Set;
-import java.util.concurrent.TimeUnit;
 import org.apache.rocketmq.client.consumer.AllocateMessageQueueStrategy;
 import org.apache.rocketmq.client.consumer.store.OffsetStore;
 import org.apache.rocketmq.client.consumer.store.ReadOffsetType;
@@ -32,6 +29,13 @@ import org.apache.rocketmq.common.protocol.heartbeat.ConsumeType;
 import org.apache.rocketmq.common.protocol.heartbeat.MessageModel;
 import org.apache.rocketmq.common.protocol.heartbeat.SubscriptionData;
 
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * NOTE: RebalancePushImpl
+ */
 public class RebalancePushImpl extends RebalanceImpl {
     private final static long UNLOCK_DELAY_TIME_MILLS = Long.parseLong(System.getProperty("rocketmq.client.unlockDelayTimeMills", "20000"));
     private final DefaultMQPushConsumerImpl defaultMQPushConsumerImpl;
@@ -40,13 +44,15 @@ public class RebalancePushImpl extends RebalanceImpl {
         this(null, null, null, null, defaultMQPushConsumerImpl);
     }
 
-    public RebalancePushImpl(String consumerGroup, MessageModel messageModel,
-        AllocateMessageQueueStrategy allocateMessageQueueStrategy,
-        MQClientInstance mQClientFactory, DefaultMQPushConsumerImpl defaultMQPushConsumerImpl) {
+    public RebalancePushImpl(
+            String consumerGroup, MessageModel messageModel,
+            AllocateMessageQueueStrategy allocateMessageQueueStrategy,
+            MQClientInstance mQClientFactory, DefaultMQPushConsumerImpl defaultMQPushConsumerImpl) {
         super(consumerGroup, messageModel, allocateMessageQueueStrategy, mQClientFactory);
         this.defaultMQPushConsumerImpl = defaultMQPushConsumerImpl;
     }
 
+    // 订阅的队列发生变化，向broker更新订阅的version
     @Override
     public void messageQueueChanged(String topic, Set<MessageQueue> mqAll, Set<MessageQueue> mqDivided) {
         /**
@@ -54,17 +60,19 @@ public class RebalancePushImpl extends RebalanceImpl {
          * Fix: inconsistency subscription may lead to consumer miss messages.
          */
         SubscriptionData subscriptionData = this.subscriptionInner.get(topic);
+        // 计算version
         long newVersion = System.currentTimeMillis();
         log.info("{} Rebalance changed, also update version: {}, {}", topic, subscriptionData.getSubVersion(), newVersion);
         subscriptionData.setSubVersion(newVersion);
 
+        // 获取订阅的队列数量，根据数量计算两个限额
         int currentQueueCount = this.processQueueTable.size();
         if (currentQueueCount != 0) {
             int pullThresholdForTopic = this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getPullThresholdForTopic();
             if (pullThresholdForTopic != -1) {
                 int newVal = Math.max(1, pullThresholdForTopic / currentQueueCount);
                 log.info("The pullThresholdForQueue is changed from {} to {}",
-                    this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getPullThresholdForQueue(), newVal);
+                        this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getPullThresholdForQueue(), newVal);
                 this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().setPullThresholdForQueue(newVal);
             }
 
@@ -72,21 +80,27 @@ public class RebalancePushImpl extends RebalanceImpl {
             if (pullThresholdSizeForTopic != -1) {
                 int newVal = Math.max(1, pullThresholdSizeForTopic / currentQueueCount);
                 log.info("The pullThresholdSizeForQueue is changed from {} to {}",
-                    this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getPullThresholdSizeForQueue(), newVal);
+                        this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getPullThresholdSizeForQueue(), newVal);
                 this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().setPullThresholdSizeForQueue(newVal);
             }
         }
 
-        // notify broker
+        // 通知broker
         this.getmQClientFactory().sendHeartbeatToAllBrokerWithLock();
     }
 
+    // 删除不再消费的队列
     @Override
     public boolean removeUnnecessaryMessageQueue(MessageQueue mq, ProcessQueue pq) {
+        // 持久化该mq的消费进度，保存到broker
+        // 在并发环境下，本节点将消费进度保存到broker，另一个消费该mq的consumer可能已经读取了消费的offset, 从而产生重复消费
+        // 目前没看到哪里能控制这一点,待明确
         this.defaultMQPushConsumerImpl.getOffsetStore().persist(mq);
+        // offsetStore中删除本地保存的消费进度
         this.defaultMQPushConsumerImpl.getOffsetStore().removeOffset(mq);
+        // 顺序消费时，unlock队列 // 暂忽略顺序消费
         if (this.defaultMQPushConsumerImpl.isConsumeOrderly()
-            && MessageModel.CLUSTERING.equals(this.defaultMQPushConsumerImpl.messageModel())) {
+                && MessageModel.CLUSTERING.equals(this.defaultMQPushConsumerImpl.messageModel())) {
             try {
                 if (pq.getConsumeLock().tryLock(1000, TimeUnit.MILLISECONDS)) {
                     try {
@@ -96,8 +110,8 @@ public class RebalancePushImpl extends RebalanceImpl {
                     }
                 } else {
                     log.warn("[WRONG]mq is consuming, so can not unlock it, {}. maybe hanged for a while, {}",
-                        mq,
-                        pq.getTryUnlockTimes());
+                            mq,
+                            pq.getTryUnlockTimes());
 
                     pq.incTryUnlockTimes();
                 }
@@ -110,6 +124,7 @@ public class RebalancePushImpl extends RebalanceImpl {
         return true;
     }
 
+    // 顺序消费时调用，暂忽略
     private boolean unlockDelay(final MessageQueue mq, final ProcessQueue pq) {
 
         if (pq.hasTempMessage()) {
@@ -137,6 +152,13 @@ public class RebalancePushImpl extends RebalanceImpl {
         this.defaultMQPushConsumerImpl.getOffsetStore().removeOffset(mq);
     }
 
+    // 计算从哪里开始消费
+    // 首先调用readOffset从broker读取队列的消费进度
+    // 如果结果>=0,则从返回的offset开始消费, 否则根据ConsumeFromWhere的类型做处理：
+    // 如果CONSUME_FROM_LAST_OFFSET， 调用MQAdminImpl().maxOffset，获取当前队列最大的offset
+    // 如果CONSUME_FROM_FIRST_OFFSET，=0
+    // 如果CONSUME_FROM_TIMESTAMP，调用MQAdminImpl().searchOffset，根据mq和时间戳从broker查询
+    // 该方法已过时，除了test没有人调用了，改成了computePullFromWhereWithException
     @Deprecated
     @Override
     public long computePullFromWhere(MessageQueue mq) {
@@ -206,7 +228,7 @@ public class RebalancePushImpl extends RebalanceImpl {
                     } else {
                         try {
                             long timestamp = UtilAll.parseDate(this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer().getConsumeTimestamp(),
-                                UtilAll.YYYYMMDDHHMMSS).getTime();
+                                    UtilAll.YYYYMMDDHHMMSS).getTime();
                             result = this.mQClientFactory.getMQAdminImpl().searchOffset(mq, timestamp);
                         } catch (MQClientException e) {
                             log.warn("Compute consume offset from last offset exception, mq={}, exception={}", mq, e);
@@ -226,6 +248,7 @@ public class RebalancePushImpl extends RebalanceImpl {
         return result;
     }
 
+    // rebalance后，遍历pullRequestList，调用consumer的executePullRequestImmediately执行pullMessage操作
     @Override
     public void dispatchPullRequest(List<PullRequest> pullRequestList) {
         for (PullRequest pullRequest : pullRequestList) {

@@ -16,33 +16,39 @@
  */
 package org.apache.rocketmq.client.impl.consumer;
 
-import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
 import org.apache.rocketmq.client.impl.factory.MQClientInstance;
 import org.apache.rocketmq.client.log.ClientLogger;
 import org.apache.rocketmq.common.ServiceThread;
-import org.apache.rocketmq.logging.InternalLogger;
 import org.apache.rocketmq.common.utils.ThreadUtils;
+import org.apache.rocketmq.logging.InternalLogger;
 
+import java.util.concurrent.*;
+
+// NOTE: PullMessageService
+// 拉取消息的服务，一个MQClientInstance实例对应一个PullMessageService，无特殊情况，一个client应该只有一个实例
+// 从MQClientInstance的实例化方式上，如果一个应用要连接两套rocketmq的broker，应该在producer和consumer中设置不同的instanceName，产生多个clientId，从而实例化多个MQClientInstance
 public class PullMessageService extends ServiceThread {
     private final InternalLogger log = ClientLogger.getLog();
+    // 一个无上限的blockingQueue，用于保存所有的PullRequest
+    // PullMessageService每次从队列中获取一个PullRequest，根据consumeGroup从mQClientFactory查到consumer，调用consumer的PullMessage从服务端拉取消息
+    // consumer拉取消息后，将消息保存到ProcessQueue，根据缓存情况，选择再executePullRequestImmediately，还是executePullRequestLater
     private final LinkedBlockingQueue<PullRequest> pullRequestQueue = new LinkedBlockingQueue<PullRequest>();
+    // PullMessageService所属的客户端实例
     private final MQClientInstance mQClientFactory;
+    // ScheduledExecutorService，用于执行executePullRequestLater，即延迟消费消息
     private final ScheduledExecutorService scheduledExecutorService = Executors
-        .newSingleThreadScheduledExecutor(new ThreadFactory() {
-            @Override
-            public Thread newThread(Runnable r) {
-                return new Thread(r, "PullMessageServiceScheduledThread");
-            }
-        });
+            .newSingleThreadScheduledExecutor(new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    return new Thread(r, "PullMessageServiceScheduledThread");
+                }
+            });
 
     public PullMessageService(MQClientInstance mQClientFactory) {
         this.mQClientFactory = mQClientFactory;
     }
 
+    // 延迟消费，延迟将ullRequest放到pullRequestQueue中
     public void executePullRequestLater(final PullRequest pullRequest, final long timeDelay) {
         if (!isStopped()) {
             this.scheduledExecutorService.schedule(new Runnable() {
@@ -56,6 +62,7 @@ public class PullMessageService extends ServiceThread {
         }
     }
 
+    // 立即消费，将PullRequest立刻放到pullRequestQueue中
     public void executePullRequestImmediately(final PullRequest pullRequest) {
         try {
             this.pullRequestQueue.put(pullRequest);
@@ -64,6 +71,8 @@ public class PullMessageService extends ServiceThread {
         }
     }
 
+    // 执行一些其他的task
+    // 目前只看到DefaultMQPushConsumerImpl，在OFFSET_ILLEGAL的时候，调用该方法做了一些事情，应该是不想用多的scheduledExecutorService吧
     public void executeTaskLater(final Runnable r, final long timeDelay) {
         if (!isStopped()) {
             this.scheduledExecutorService.schedule(r, timeDelay, TimeUnit.MILLISECONDS);
@@ -76,6 +85,11 @@ public class PullMessageService extends ServiceThread {
         return scheduledExecutorService;
     }
 
+    // 拉取消息
+    // 根据consumerGrup，从mQClientFactory查询Consumer
+    // 调用Consumer的pullMessage方法，从broker拉取消息
+    // pullRequest的processQueue在rebalanceImpl destroy时会被drop，故旧的关闭的consumer的pullRequest会被忽略
+    // 即使在上一个consumer关闭，同名的新consumer已创建
     private void pullMessage(final PullRequest pullRequest) {
         final MQConsumerInner consumer = this.mQClientFactory.selectConsumer(pullRequest.getConsumerGroup());
         if (consumer != null) {

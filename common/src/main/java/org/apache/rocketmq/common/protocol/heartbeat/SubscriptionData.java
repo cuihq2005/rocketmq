@@ -26,12 +26,20 @@ import org.apache.rocketmq.common.filter.ExpressionType;
 import java.util.HashSet;
 import java.util.Set;
 
+/**
+ * NOTE: SubscriptionData
+ */
 public class SubscriptionData implements Comparable<SubscriptionData> {
     public final static String SUB_ALL = "*";
     private boolean classFilterMode = false;
+    // 订阅的topic
     private String topic;
+    // 订阅的参数
     private String subString;
+    // 当订阅TAG且不是SUB_ALL，此处保存拆分好的tags
     private Set<String> tagsSet = new HashSet<String>();
+    // 每个tag的hash值
+    // 服务端用hash保存tag的信息，根据hash获取到数据后，客户端也会用tag过滤下查询到的结果，不会出现两个tag的hash值相同，导致被错误消费的情况
     private Set<Integer> codeSet = new HashSet<Integer>();
     private long subVersion = System.currentTimeMillis();
     private String expressionType = ExpressionType.TAG;

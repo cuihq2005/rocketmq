@@ -95,6 +95,14 @@ import org.apache.rocketmq.remoting.exception.RemotingException;
 import org.apache.rocketmq.remoting.exception.RemotingTimeoutException;
 import org.apache.rocketmq.remoting.exception.RemotingTooMuchRequestException;
 
+// NOTE: DefaultMQProducerImpl
+// 资源情况：
+// 每个producer拥有一个defaultAsyncSenderExecutor，线程数为cpu核数, 线程名AsyncSenderExecutor_
+// 每个producer拥有一个asyncSenderExecutor，可set，为空时使用defaultAsyncSenderExecutor，忽略
+// producer有一个checkExecutor，但貌似只有TransactionMQProducer才会实例化，忽略
+// 故一个producer默认有cpu核数的线程
+
+// 一个平台至少有两个producer，一个自定义的，一个MQClientInstance内部默认的
 public class DefaultMQProducerImpl implements MQProducerInner {
     private final InternalLogger log = ClientLogger.getLog();
     private final Random random = new Random();
